@@ -1,0 +1,13 @@
+pydantic
+fastapi
+sqlmodel
+uvicorn[standard]
+web3
+ens
+eth-account
+python-dotenv
+requests
+apscheduler
+python-multipart
+pydantic-settings
+sqlalchemy
