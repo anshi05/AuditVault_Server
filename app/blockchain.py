@@ -89,32 +89,66 @@ def recover_signer_from_raw(raw_hash: bytes, signature: str) -> str:
     signer = w3.eth.account.recover_message(msg, signature=signature)
     return Web3.to_checksum_address(signer)
 
-def _send_signed_transaction_and_wait(signed_tx):
+from web3 import Web3
+
+def _send_signed_transaction_and_wait(signed_tx, w3: Web3, timeout=120):
     """
-    Helper that works with both eth-account/web3 return shapes:
-      - signed_tx.rawTransaction  (older)
-      - signed_tx.raw_transaction (newer)
-    Returns the transaction receipt.
+    Sends a signed transaction and waits for the receipt.
+    Handles both eth-account/web3 return shapes:
+      - signed_tx.rawTransaction (old web3)
+      - signed_tx.raw_transaction (new web3)
+    Also handles dict-like objects gracefully.
+
+    Args:
+        signed_tx: Signed transaction object
+        w3: Web3 instance
+        timeout: Max time (in seconds) to wait for receipt
+
+    Returns:
+        Transaction receipt (dict)
+
+    Raises:
+        RuntimeError: If the signed transaction has no raw data or submission fails.
     """
     raw = None
-    # try both attribute names
-    if hasattr(signed_tx, "rawTransaction"):
-        raw = signed_tx.rawTransaction
-    elif hasattr(signed_tx, "raw_transaction"):
-        raw = signed_tx.raw_transaction
-    else:
-        # last-resort: look through dict representation
-        try:
-            raw = signed_tx._dict.get("rawTransaction") or signed_tx.dict_.get("raw_transaction")
-        except Exception:
-            raw = None
+
+    # Handle different possible attribute names or dict forms
+    try:
+        if hasattr(signed_tx, "rawTransaction"):
+            raw = signed_tx.rawTransaction
+        elif hasattr(signed_tx, "raw_transaction"):
+            raw = signed_tx.raw_transaction
+        elif isinstance(signed_tx, dict):
+            raw = signed_tx.get("rawTransaction") or signed_tx.get("raw_transaction")
+    except Exception as e:
+        raise RuntimeError(f"Error extracting raw transaction bytes: {e}")
 
     if raw is None:
-        raise RuntimeError("Signed transaction object does not contain raw tx bytes (rawTransaction/raw_transaction)")
+        raise RuntimeError(
+            "Signed transaction object does not contain raw transaction bytes "
+            "(rawTransaction/raw_transaction missing)."
+        )
 
-    tx_hash = w3.eth.send_raw_transaction(raw)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    return receipt
+    # Validate type and ensure raw is bytes
+    if not isinstance(raw, (bytes, bytearray)):
+        try:
+            # Some SDKs may encode as hex string — handle gracefully
+            if isinstance(raw, str) and raw.startswith("0x"):
+                raw = bytes.fromhex(raw[2:])
+            else:
+                raise ValueError("Raw transaction must be bytes or 0x-prefixed hex string.")
+        except Exception as e:
+            raise RuntimeError(f"Invalid raw transaction format: {e}")
+
+    try:
+        tx_hash = w3.eth.send_raw_transaction(raw)
+        print(f"Transaction submitted. Hash: {tx_hash.hex()}")
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        print(f"Transaction confirmed in block {receipt['blockNumber']}")
+        return receipt
+
+    except Exception as e:
+        raise RuntimeError(f"Error while sending or waiting for transaction: {e}")
 
 
 def record_inspection_with_signature(
@@ -150,6 +184,7 @@ def record_inspection_with_signature(
     receipt = _send_signed_transaction_and_wait(signed)
     return receipt
 
+from hexbytes import HexBytes
 
 def issue_certificate(submitter_private_key, cert_hash, owner, expiry):
     acct = w3.eth.account.from_key(submitter_private_key)
@@ -166,8 +201,17 @@ def issue_certificate(submitter_private_key, cert_hash, owner, expiry):
     })
 
     signed = w3.eth.account.sign_transaction(tx, private_key=submitter_private_key)
-    receipt = _send_signed_transaction_and_wait(signed)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    # Convert any bytes fields to hex string here
+    if isinstance(receipt, bytes):
+        receipt = receipt.hex()
+    elif hasattr(receipt, "transactionHash"):
+        receipt.transactionHash = receipt.transactionHash.hex()
+
     return receipt
+
 
 
 def revoke_certificate(submitter_private_key, cert_hash):
@@ -183,7 +227,6 @@ def revoke_certificate(submitter_private_key, cert_hash):
     signed = w3.eth.account.sign_transaction(tx, private_key=submitter_private_key)
     receipt = _send_signed_transaction_and_wait(signed)
     return receipt
-
 
 def _role_bytes32(role_name: str) -> bytes:
     # Accept either role name like "INSPECTOR_ROLE" or a bytes32 hex string

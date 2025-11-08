@@ -2,7 +2,9 @@
 import os
 import time
 import tempfile
+from pydantic import BaseModel
 from typing import Optional
+from fastapi import Request
 from fastapi import Header
 from typing import Literal
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -30,10 +32,14 @@ from .blockchain import (
 )
 from .schemas import UploadResponse, SignPayload, SubmitInspectionIn, IssueCertificateIn
 from .tasks import scheduler
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Compliance Platform Backend")
 from fastapi.middleware.cors import CORSMiddleware
-
+from .pdf_parser import parse_certificate
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # or restrict to ["http://localhost:5173"] (Vite default)
@@ -179,31 +185,106 @@ async def submit_inspection(payload: SubmitInspectionIn):
     }
     create_inspection(rec)
     return {"tx": receipt.transactionHash.hex() if hasattr(receipt, "transactionHash") else str(receipt)}
-
+from fastapi import FastAPI, HTTPException
 from hexbytes import HexBytes
+import time
+class IssueCertificateIn(BaseModel):
+    cert_id: str
+    owner: str
+    expiry: Optional[int] = 0
 
+
+# === Updated endpoint ===
 @app.post("/issue-certificate")
-def issue_certificate_endpoint(data: IssueCertificateIn):
-    cert_hash_bytes = w3.keccak(text=data.cert_id)      # HexBytes (32 bytes)
+async def issue_certificate_endpoint(file: UploadFile = File(...)):
+    """
+    Endpoint: Accepts a PDF inspection certificate,
+    extracts cert_id, owner, expiry, and issues it on-chain.
+    """
     try:
-        receipt = issue_certificate(settings.SUBMITTER_PK, cert_hash_bytes, data.owner, data.expiry or 0)
+        # Step 1: Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp.flush()
+            pdf_path = tmp.name
+
+        # Step 2: Parse the PDF to extract details
+        parsed = parse_certificate(pdf_path)
+        cert_id = parsed.get("cert_id")
+        owner = parsed.get("owner")
+        expiry = parsed.get("expiry_date", 0)
+
+        if not cert_id or not owner:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to extract certificate details (cert_id or owner missing)."
+            )
+
+        # Step 3: Hash the certificate ID
+        cert_hash_bytes = w3.keccak(text=cert_id)
+
+        # Step 4: Issue on-chain
+        # Step 4: Issue on-chain
+        try:
+            # Ensure owner is valid Ethereum address
+            if not owner.startswith("0x") or len(owner) != 42:
+                pseudo_owner = "0x" + w3.keccak(text=owner).hex()[-40:]
+            else:
+                pseudo_owner = owner
+
+            receipt = issue_certificate(
+                settings.SUBMITTER_PK,
+                cert_hash_bytes,
+                pseudo_owner,
+                expiry or 0
+            )
+        except Exception as e:
+            logger.error("Blockchain issue failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"Blockchain error: {e}")
+
+
+        # Step 5: Prepare DB entry
+        cert_hash_hex = cert_hash_bytes.hex()
+        obj = {
+            "cert_hash": cert_hash_hex,
+            "issuer": w3.eth.account.from_key(settings.SUBMITTER_PK).address,
+            "owner": owner,
+            "expiry": expiry,
+            "revoked": False,
+            "issued_at": int(time.time()),
+            "tx_hash": (
+                receipt.transactionHash.hex()
+                if hasattr(receipt, "transactionHash")
+                else str(receipt)
+            ),
+        }
+
+        # Step 6: Save in DB
+        create_certificate(obj)
+
+        # Step 7: Respond to client
+        return {
+            "status": "success",
+            "message": "Certificate issued successfully",
+            "data": {
+                "cert_id": cert_id,
+                "cert_hash": cert_hash_hex,
+                "owner": owner,
+                "expiry": expiry,
+                "tx_hash": (
+                    receipt.transactionHash.hex()
+                    if hasattr(receipt, "transactionHash")
+                    else str(receipt)
+                ),
+            },
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("Unhandled error during certificate issue: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-
-    cert_hash_hex = cert_hash_bytes.hex()
-    obj = {
-        "cert_hash": cert_hash_hex,
-        "issuer": w3.eth.account.from_key(settings.SUBMITTER_PK).address,
-        "owner": data.owner,
-        "expiry": data.expiry,
-        "revoked": False,
-        "issued_at": int(time.time()),
-        "tx_hash": receipt.transactionHash.hex() if hasattr(receipt, "transactionHash") else str(receipt),
-    }
-    create_certificate(obj)
-    return {"tx": receipt.transactionHash.hex() if hasattr(receipt, "transactionHash") else str(receipt), "cert_hash": cert_hash_hex}
-
-
 @app.post("/revoke-certificate")
 def revoke_certificate_endpoint(cert_hash: str):
     """
@@ -222,6 +303,7 @@ def revoke_certificate_endpoint(cert_hash: str):
         pass
 
     return {"tx": receipt.transactionHash.hex() if hasattr(receipt, "transactionHash") else str(receipt)}
+
 
 @app.post("/debug-raw-hash")
 def debug_raw_hash(data: dict):
